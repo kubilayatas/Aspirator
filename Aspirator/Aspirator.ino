@@ -1,191 +1,505 @@
+/*
+ * Akilli Aspirator - ESP32-C3 Super Mini
+ * SinricPro (Google Home / Alexa / Siri) + WiFiManager + GitHub OTA
+ *
+ * Arduino IDE ayarlari:
+ *   Board            : ESP32C3 Dev Module   (Nologo Super Mini menusunde OTA'li buyuk sema yok)
+ *   Partition Scheme : No FS 4MB (2MB APP x2)   veya   Minimal SPIFFS (1.9MB APP with OTA)
+ *   USB CDC On Boot  : Enabled   (Seri monitor USB uzerinden calissin diye)
+ *
+ * Test edilen surumler: esp32 core 3.3.2, SinricPro 5.1.0, WiFiManager 2.0.17
+ */
+
 #include <WiFi.h>
 #include <WiFiManager.h>
-#include <WiFiClientSecure.h>
+#include <Preferences.h>
 #include <HTTPClient.h>
 #include <HTTPUpdate.h>
+#include <WiFiClientSecure.h>
 #include <SinricPro.h>
 #include <SinricProSwitch.h>
+#include "driver/gpio.h"
 
-// --- SİNRİC PRO BİLGİLERİ ---
-#define APP_KEY           "SENIN_APP_KEY_BURAYA"
-#define APP_SECRET        "SENIN_APP_SECRET_BURAYA"
-#define LIGHT_ID          "SENIN_ISIK_DEVICE_ID"
-#define SPD1_ID           "SENIN_HIZ1_DEVICE_ID"
-#define SPD2_ID           "SENIN_HIZ2_DEVICE_ID"
-#define SPD3_ID           "SENIN_HIZ3_DEVICE_ID"
+// ================== SURUM & OTA ==================
+// Her yeni surumde BURAYI ve GitHub'daki version.txt'yi ayni degere guncelle.
+#define FW_VERSION "1.0.0"
+const char* OTA_VERSION_URL  = "https://raw.githubusercontent.com/KULLANICI/Aspirator/main/version.txt";
+const char* OTA_FIRMWARE_URL = "https://raw.githubusercontent.com/KULLANICI/Aspirator/main/firmware.bin";
+const unsigned long OTA_CHECK_INTERVAL_MS = 6UL * 60UL * 60UL * 1000UL;  // 6 saatte bir kontrol
+const unsigned long OTA_IDLE_REQUIRED_MS  = 60UL * 1000UL;               // cihaz 1 dk bostaysa guncelle
 
-// --- GITHUB OTA AYARLARI ---
-const String CURRENT_VERSION = "1.0.1";
-const String GITHUB_VERSION_URL = "https://raw.githubusercontent.com/kubilayatas/Aspirator/main/version.txt";
-const String GITHUB_FIRMWARE_URL = "https://raw.githubusercontent.com/kubilayatas/Aspirator/main/firmware.bin";
+// ================== PINLER ==================
+const uint8_t PIN_BTN_LIGHT = 2;   // TTP224 kanal 1
+const uint8_t PIN_BTN_SPEED = 3;   // TTP224 kanal 2 -> dongusel hiz (0>1>2>3>0)
+// GPIO 4 ve 5 (arizali / yedek kanallar) bilerek kullanilmiyor.
 
-// --- PİN TANIMLAMALARI ---
-const int PIN_BTN_LIGHT = 2; 
-const int PIN_BTN_SPD   = 3; // Döngüsel Hız Tuşu
+const uint8_t PIN_OUT_LIGHT = 6;                 // Triyak, Active-LOW
+const uint8_t PIN_OUT_SPEED[3] = {7, 10, 21};    // Triyak, Active-LOW
+const uint8_t PIN_LED_LIGHT = 0;                 // LED, Active-HIGH
+const uint8_t PIN_LED_SPEED[3] = {1, 20, 8};     // LED, Active-HIGH
 
-const int PIN_OUT_LIGHT = 6;
-const int PIN_OUT_SPD1  = 7;
-const int PIN_OUT_SPD2  = 10;
-const int PIN_OUT_SPD3  = 21;
+// LED'ler anot ESP'ye (katot GND'ye) bagliysa HIGH yanar. Test sirasinda LED'ler
+// "ters" davraniyorsa (yanmasi gerekirken sonuk, sonmesi gerekirken yanik) bu iki satiri yer degistir.
+#define LED_ON   LOW
+#define LED_OFF  HIGH
 
-const int PIN_LED_LIGHT = 0;
-const int PIN_LED_SPD1  = 1;
-const int PIN_LED_SPD2  = 20;
-const int PIN_LED_SPD3  = 8;
+// ================== ZAMANLAMALAR ==================
+const unsigned long DEBOUNCE_MS           = 50;
+const unsigned long FACTORY_RESET_HOLD_MS = 8000;    // Isik tusuna 8 sn basili tut -> fabrika ayari
+const unsigned long SPEED_DEADTIME_MS     = 30;      // Hiz degisiminde iki sargi ayni anda enerjilenmesin
+const unsigned long WIFI_CONNECT_TIMEOUT  = 30000;   // Kayitli aga baglanma denemesi
+const unsigned long PORTAL_TIMEOUT_S      = 180;     // Kayitli ag varken portal ne kadar acik kalsin
+const unsigned long WIFI_LOST_BEFORE_PORTAL = 120000;// Baglanti 2 dk koparsa portali ac
 
-// --- DURUM DEĞİŞKENLERİ ---
-bool lightState = false;
-int currentSpeed = 0; // 0: Kapalı, 1, 2, 3
+const char* AP_NAME = "Aspirator_Kurulum";
 
-// --- BUTON SINIFI ---
-class SmartButton {
-  private:
-    int pin;
-    bool lastReading = LOW;
-    unsigned long lastDebounceTime = 0;
-    const unsigned long debounceDelay = 50; 
-    bool waitingForRelease = false;
+// ================== DURUM ==================
+bool lightState   = false;
+int  currentSpeed = 0;     // istenen hiz
+int  appliedSpeed = 0;     // donanimda su an uygulanan hiz
+unsigned long lastActivityMs = 0;
 
+// ================== AYARLAR (NVS) ==================
+Preferences prefs;
+String appKey, appSecret, devId[4];   // 0: isik, 1-3: hizlar
+const char* PREF_KEYS[4] = {"lightId", "spd1Id", "spd2Id", "spd3Id"};
+
+WiFiManager wm;
+WiFiManagerParameter pAppKey   ("b1b4f628-f682-4fc1-ad87-a3e2474cd799",    "SinricPro APP KEY",    "", 64);
+WiFiManagerParameter pAppSecret("fc358aba-dd6d-4902-88e1-5b8f9a708595-808b75f4-28d5-4ff5-864a-ff3801a2b194", "SinricPro APP SECRET", "", 128);
+WiFiManagerParameter pDev0     ("6abdf7b5a60031348f5d4be1",   "Isik Device ID",       "", 40);
+WiFiManagerParameter pDev1     ("spd1Id",    "Hiz 1 Device ID",      "", 40);
+WiFiManagerParameter pDev2     ("spd2Id",    "Hiz 2 Device ID",      "", 40);
+WiFiManagerParameter pDev3     ("spd3Id",    "Hiz 3 Device ID",      "", 40);
+WiFiManagerParameter* pDev[4] = {&pDev0, &pDev1, &pDev2, &pDev3};
+bool paramsChanged = false;
+
+// ================== SINRICPRO ==================
+SinricProSwitch* devs[4] = {nullptr, nullptr, nullptr, nullptr};
+bool sinricStarted = false;
+bool reported[4];
+bool reportValid[4] = {false, false, false, false};
+
+// ================== AG DURUM MAKINESI ==================
+enum NetState { NET_CONNECTING, NET_PORTAL, NET_ONLINE };
+NetState netState = NET_CONNECTING;
+unsigned long netTimer = 0;
+unsigned long wifiLostAt = 0;
+
+// ================== OTA DURUMU ==================
+bool otaCheckDue = false;
+unsigned long lastOtaCheck = 0;
+bool otaPending = false;
+String otaNewVersion;
+
+// =====================================================================
+//  DOKUNMATIK TUS (debounce + kisa basma + uzun basma)
+// =====================================================================
+class TouchButton {
   public:
-    SmartButton(int p) { pin = p; pinMode(pin, INPUT); }
-    bool onRelease() {
-      bool reading = digitalRead(pin);
-      bool triggered = false;
+    enum Event { NONE, SHORT_PRESS, LONG_PRESS };
+    explicit TouchButton(uint8_t p) : pin(p) {}
+    void begin() { pinMode(pin, INPUT); }
+
+    Event update() {
+      bool raw = digitalRead(pin) == HIGH;
       unsigned long now = millis();
-      if (reading != lastReading) lastDebounceTime = now;
-      if ((now - lastDebounceTime) > debounceDelay) {
-        if (reading == HIGH && !waitingForRelease) waitingForRelease = true;
-        else if (reading == LOW && waitingForRelease) {
-          waitingForRelease = false;
-          triggered = true;
+      if (raw != lastRaw) { lastRaw = raw; lastChange = now; }
+      if (now - lastChange < DEBOUNCE_MS) return NONE;
+      if (!raw && !stable) armed = true;   // tus bos gorulduyse hemen hazir
+
+      if (raw != stable) {
+        stable = raw;
+        if (!stable) {                       // birakildi
+          bool wasArmedPress = armed && pressed;
+          armed = true;                      // tus en az bir kez bos goruldu
+          pressed = false;
+          if (wasArmedPress && !longFired) return SHORT_PRESS;
+          return NONE;
         }
+        pressed = true;                      // basildi
+        pressStart = now;
+        longFired = false;
+        return NONE;
       }
-      lastReading = reading;
-      return triggered;
+      if (armed && pressed && !longFired && now - pressStart >= FACTORY_RESET_HOLD_MS) {
+        longFired = true;
+        return LONG_PRESS;
+      }
+      return NONE;
     }
+
+  private:
+    uint8_t pin;
+    bool lastRaw = false, stable = false, pressed = false, longFired = false;
+    bool armed = false;   // acilista takili (surekli HIGH) kanal yanlislikla reset atmasin
+    unsigned long lastChange = 0, pressStart = 0;
 };
 
-SmartButton btnLight(PIN_BTN_LIGHT);
-SmartButton btnSpeedCycle(PIN_BTN_SPD);
+TouchButton btnLight(PIN_BTN_LIGHT);
+TouchButton btnSpeed(PIN_BTN_SPEED);
 
-// --- DONANIM VE BULUT GÜNCELLEME ---
-void updateHardwareAndCloud() {
+// =====================================================================
+//  DONANIM
+// =====================================================================
+// Pini OUTPUT yapmadan ONCE seviyesini ayarla -> acilista triyaklara LOW glitch'i gitmez
+void initOutput(uint8_t pin, uint8_t level) {
+  gpio_set_level((gpio_num_t)pin, level);
+  pinMode(pin, OUTPUT);
+  digitalWrite(pin, level);
+}
+
+void applyOutputs() {
   digitalWrite(PIN_OUT_LIGHT, lightState ? LOW : HIGH);
-  digitalWrite(PIN_OUT_SPD1, (currentSpeed == 1) ? LOW : HIGH);
-  digitalWrite(PIN_OUT_SPD2, (currentSpeed == 2) ? LOW : HIGH);
-  digitalWrite(PIN_OUT_SPD3, (currentSpeed == 3) ? LOW : HIGH);
+  digitalWrite(PIN_LED_LIGHT, lightState ? LED_ON : LED_OFF);
 
-  digitalWrite(PIN_LED_LIGHT, lightState ? HIGH : LOW);
-  digitalWrite(PIN_LED_SPD1, (currentSpeed == 1) ? HIGH : LOW);
-  digitalWrite(PIN_LED_SPD2, (currentSpeed == 2) ? HIGH : LOW);
-  digitalWrite(PIN_LED_SPD3, (currentSpeed == 3) ? HIGH : LOW);
-
-  if (WiFi.status() == WL_CONNECTED) {
-    SinricPro[LIGHT_ID].as<SinricProSwitch>().sendPowerStateEvent(lightState);
-    SinricPro[SPD1_ID].as<SinricProSwitch>().sendPowerStateEvent(currentSpeed == 1);
-    SinricPro[SPD2_ID].as<SinricProSwitch>().sendPowerStateEvent(currentSpeed == 2);
-    SinricPro[SPD3_ID].as<SinricProSwitch>().sendPowerStateEvent(currentSpeed == 3);
-  }
-}
-
-// --- SİNRİC PRO CALLBACK FONKSİYONLARI ---
-bool onPowerStateLight(const String &deviceId, bool &state) {
-  lightState = state;
-  updateHardwareAndCloud();
-  return true;
-}
-
-bool onPowerStateSpeed(const String &deviceId, bool &state, int targetSpeed) {
-  if (state) currentSpeed = targetSpeed; 
-  else if (currentSpeed == targetSpeed) currentSpeed = 0; 
-  updateHardwareAndCloud();
-  return true;
-}
-
-// --- OTOMATİK GITHUB OTA KONTROLÜ ---
-void autoUpdateCheck() {
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("Guncelleme kontrol ediliyor...");
-    WiFiClientSecure client;
-    client.setInsecure(); // GitHub SSL doğrulaması için zorunlu
-    
-    HTTPClient http;
-    http.begin(client, GITHUB_VERSION_URL);
-    int httpCode = http.GET();
-    
-    if (httpCode == HTTP_CODE_OK) {
-      String newVersion = http.getString();
-      newVersion.trim();
-      
-      if (newVersion != CURRENT_VERSION && newVersion.length() > 0) {
-        Serial.println("Yeni surum bulundu (" + newVersion + "). İndiriliyor...");
-        t_httpUpdate_return ret = httpUpdate.update(client, GITHUB_FIRMWARE_URL);
-        if (ret == HTTP_UPDATE_FAILED) {
-          Serial.printf("OTA Hatasi (%d): %s\n", httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
-        }
-      } else {
-        Serial.println("Sistem guncel.");
-      }
+  if (currentSpeed != appliedSpeed) {
+    // 1) Once tum hiz triyaklarini kapat
+    for (int i = 0; i < 3; i++) {
+      digitalWrite(PIN_OUT_SPEED[i], HIGH);
+      digitalWrite(PIN_LED_SPEED[i], LED_OFF);
     }
-    http.end();
+    // 2) Eski triyak sifir geciste sonsun (50 Hz'de yarim periyot 10 ms)
+    if (appliedSpeed != 0 && currentSpeed != 0) delay(SPEED_DEADTIME_MS);
+    // 3) Yeni hizi ac
+    if (currentSpeed >= 1 && currentSpeed <= 3) {
+      digitalWrite(PIN_OUT_SPEED[currentSpeed - 1], LOW);
+      digitalWrite(PIN_LED_SPEED[currentSpeed - 1], LED_ON);
+      Serial.printf("[Hiz] %d. kademe -> triyak GPIO%d, LED GPIO%d\n", currentSpeed,
+                    PIN_OUT_SPEED[currentSpeed - 1], PIN_LED_SPEED[currentSpeed - 1]);
+    } else {
+      Serial.println("[Hiz] Motor kapali");
+    }
+    appliedSpeed = currentSpeed;
+  }
+  lastActivityMs = millis();
+}
+
+// =====================================================================
+//  SINRICPRO
+// =====================================================================
+bool desiredState(int i) { return (i == 0) ? lightState : (currentSpeed == i); }
+
+// Sadece degisen durumlari gonderir. SinricPro cihaz basina saniyede 1 olay
+// sinirina sahip; gonderilemeyen olay kaybolmaz, sonraki denemede gider.
+void syncCloud() {
+  if (!sinricStarted || WiFi.status() != WL_CONNECTED || !SinricPro.isConnected()) return;
+  static unsigned long lastTry = 0;
+  if (millis() - lastTry < 200) return;
+  lastTry = millis();
+
+  for (int i = 0; i < 4; i++) {
+    if (!devs[i]) continue;
+    bool want = desiredState(i);
+    if (reportValid[i] && reported[i] == want) continue;
+    if (devs[i]->sendPowerStateEvent(want)) {
+      reported[i] = want;
+      reportValid[i] = true;
+    }
   }
 }
 
-void setup() {
-  Serial.begin(115200);
+bool onLightPower(const String& deviceId, bool& state) {
+  lightState = state;
+  applyOutputs();
+  reported[0] = state; reportValid[0] = true;   // cevap zaten bu durumu bildiriyor
+  return true;
+}
 
-  pinMode(PIN_OUT_LIGHT, OUTPUT); pinMode(PIN_OUT_SPD1, OUTPUT); 
-  pinMode(PIN_OUT_SPD2, OUTPUT); pinMode(PIN_OUT_SPD3, OUTPUT);
-  pinMode(PIN_LED_LIGHT, OUTPUT); pinMode(PIN_LED_SPD1, OUTPUT); 
-  pinMode(PIN_LED_SPD2, OUTPUT); pinMode(PIN_LED_SPD3, OUTPUT);
-  updateHardwareAndCloud(); 
+bool handleSpeedPower(int n, bool& state) {
+  if (state) currentSpeed = n;                     // radyo buton: digerleri duser
+  else if (currentSpeed == n) currentSpeed = 0;
+  applyOutputs();
+  reported[n] = state; reportValid[n] = true;
+  return true;                                     // diger hizlarin "kapali" bilgisi syncCloud ile gider
+}
 
-  // --- WiFiManager Kurgusu ---
-  WiFiManager wm;
-  // wm.resetSettings(); // Agi unutturmak istersen bu satiri ac
-  wm.setConfigPortalTimeout(120); // 2 dakika icinde sifre girilmezse portali kapat ve offline devam et!
-  
-  bool res = wm.autoConnect("Aspirator_Kurulum"); 
-  if(!res) {
-    Serial.println("WiFi baglanamadi. Cevrimdisi (Offline) modda fiziksel tuslarla calisacak.");
-  } else {
-    Serial.println("WiFi Baglandi!");
-    
-    // İnternet varsa sessizce guncelleme kontrolu yap
-    autoUpdateCheck();
+bool credentialsValid() {
+  if (appKey.length() < 30 || appSecret.length() < 30) return false;
+  for (int i = 0; i < 4; i++) if (devId[i].length() < 20) return false;
+  return true;
+}
 
-    // SinricPro Kurulumu
-    SinricProSwitch& myLight = SinricPro[LIGHT_ID];
-    myLight.onPowerState(onPowerStateLight);
-    
-    SinricProSwitch& mySpd1 = SinricPro[SPD1_ID];
-    mySpd1.onPowerState([](const String& id, bool& state) { return onPowerStateSpeed(id, state, 1); });
-    
-    SinricProSwitch& mySpd2 = SinricPro[SPD2_ID];
-    mySpd2.onPowerState([](const String& id, bool& state) { return onPowerStateSpeed(id, state, 2); });
-    
-    SinricProSwitch& mySpd3 = SinricPro[SPD3_ID];
-    mySpd3.onPowerState([](const String& id, bool& state) { return onPowerStateSpeed(id, state, 3); });
-
-    SinricPro.begin(APP_KEY, APP_SECRET);
+void startSinric() {
+  if (sinricStarted || !credentialsValid()) {
+    if (!credentialsValid()) Serial.println("[Sinric] Bilgiler eksik, sadece yerel calisma.");
+    return;
   }
+  // SinricPro[id] gecici bir Proxy dondurur; referansa baglamak onu gercek cihaza cevirir.
+  SinricProSwitch& light = SinricPro[devId[0]];
+  SinricProSwitch& s1    = SinricPro[devId[1]];
+  SinricProSwitch& s2    = SinricPro[devId[2]];
+  SinricProSwitch& s3    = SinricPro[devId[3]];
+  devs[0] = &light; devs[1] = &s1; devs[2] = &s2; devs[3] = &s3;
+
+  light.onPowerState(onLightPower);
+  s1.onPowerState([](const String&, bool& st) { return handleSpeedPower(1, st); });
+  s2.onPowerState([](const String&, bool& st) { return handleSpeedPower(2, st); });
+  s3.onPowerState([](const String&, bool& st) { return handleSpeedPower(3, st); });
+
+  SinricPro.onConnected([]() {
+    Serial.println("[Sinric] Baglandi");
+    for (int i = 0; i < 4; i++) reportValid[i] = false;   // yeniden baglaninca tum durumu esitle
+  });
+  SinricPro.onDisconnected([]() { Serial.println("[Sinric] Baglanti koptu"); });
+
+  SinricPro.begin(appKey, appSecret);
+  sinricStarted = true;
+  Serial.println("[Sinric] Baslatildi");
+}
+
+// =====================================================================
+//  AYARLAR
+// =====================================================================
+void loadSettings() {
+  prefs.begin("aspirator", false);
+  appKey    = prefs.getString("appKey", "");
+  appSecret = prefs.getString("appSecret", "");
+  for (int i = 0; i < 4; i++) devId[i] = prefs.getString(PREF_KEYS[i], "");
+
+  pAppKey.setValue(appKey.c_str(), 64);
+  pAppSecret.setValue(appSecret.c_str(), 128);
+  for (int i = 0; i < 4; i++) pDev[i]->setValue(devId[i].c_str(), 40);
+}
+
+String cleanParam(WiFiManagerParameter& p) {
+  String s = p.getValue();
+  s.trim();
+  return s;
+}
+
+// Portalda "Save" basilinca WiFiManager cagirir
+void onParamsSaved() {
+  String k = cleanParam(pAppKey), s = cleanParam(pAppSecret), d[4];
+  for (int i = 0; i < 4; i++) d[i] = cleanParam(*pDev[i]);
+
+  bool changed = (k != appKey) || (s != appSecret);
+  for (int i = 0; i < 4; i++) changed |= (d[i] != devId[i]);
+  if (!changed) return;
+
+  appKey = k; appSecret = s;
+  prefs.putString("appKey", appKey);
+  prefs.putString("appSecret", appSecret);
+  for (int i = 0; i < 4; i++) { devId[i] = d[i]; prefs.putString(PREF_KEYS[i], devId[i]); }
+  paramsChanged = true;
+  Serial.println("[Ayar] SinricPro bilgileri kaydedildi");
+}
+
+void factoryReset() {
+  Serial.println("[Reset] Fabrika ayarlarina donuluyor...");
+  lightState = false; currentSpeed = 0; applyOutputs();
+  for (int n = 0; n < 6; n++) {                      // tum LED'ler 3 kez yanip soner
+    for (int i = 0; i < 3; i++) digitalWrite(PIN_LED_SPEED[i], n % 2 == 0 ? LED_ON : LED_OFF);
+    digitalWrite(PIN_LED_LIGHT, n % 2 == 0 ? LED_ON : LED_OFF);
+    delay(250);
+  }
+  prefs.clear();
+  wm.resetSettings();
+  delay(300);
+  ESP.restart();
+}
+
+// =====================================================================
+//  AG
+// =====================================================================
+void startConnecting() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin();                       // WiFiManager'in kaydettigi SSID/sifre
+  netState = NET_CONNECTING;
+  netTimer = millis();
+  Serial.println("[WiFi] Kayitli aga baglaniliyor...");
+}
+
+void startPortal(unsigned long timeoutS) {
+  wm.setConfigPortalTimeout(timeoutS);          // 0 = suresiz
+  wm.startConfigPortal(AP_NAME);                // bloklamaz, tuslar calismaya devam eder
+  netState = NET_PORTAL;
+  Serial.printf("[WiFi] Kurulum agi acildi: %s\n", AP_NAME);
+}
+
+void goOnline() {
+  netState = NET_ONLINE;
+  wifiLostAt = 0;
+  Serial.print("[WiFi] Baglandi, IP: ");
+  Serial.println(WiFi.localIP());
+  startSinric();
+  if (lastOtaCheck == 0) otaCheckDue = true;   // ilk baglantida bir kez kontrol et
+}
+
+void handleNetwork() {
+  switch (netState) {
+    case NET_CONNECTING:
+      if (WiFi.status() == WL_CONNECTED) goOnline();
+      else if (millis() - netTimer > WIFI_CONNECT_TIMEOUT) startPortal(PORTAL_TIMEOUT_S);
+      break;
+
+    case NET_PORTAL:
+      if (wm.process()) {                          // kullanici yeni bilgileri girdi ve baglandi
+        if (paramsChanged && sinricStarted) {      // calisan SinricPro'yu yeni hesapla bastan kur
+          delay(500);
+          ESP.restart();
+        }
+        paramsChanged = false;
+        goOnline();
+      } else if (!wm.getConfigPortalActive()) {    // portal zaman asimi -> kayitli agi tekrar dene
+        startConnecting();
+      }
+      break;
+
+    case NET_ONLINE:
+      if (WiFi.status() == WL_CONNECTED) {
+        wifiLostAt = 0;
+      } else {
+        if (wifiLostAt == 0) wifiLostAt = millis();          // kisa kopmalarda ESP kendisi baglanir
+        else if (millis() - wifiLostAt > WIFI_LOST_BEFORE_PORTAL) startPortal(PORTAL_TIMEOUT_S);
+      }
+      break;
+  }
+}
+
+// =====================================================================
+//  OTA
+// =====================================================================
+bool isNewerVersion(const String& remote, const char* local) {
+  int r[3] = {0, 0, 0}, l[3] = {0, 0, 0};
+  if (sscanf(remote.c_str(), "%d.%d.%d", &r[0], &r[1], &r[2]) < 1) return false;
+  sscanf(local, "%d.%d.%d", &l[0], &l[1], &l[2]);
+  for (int i = 0; i < 3; i++) {
+    if (r[i] > l[i]) return true;
+    if (r[i] < l[i]) return false;
+  }
+  return false;
+}
+
+void checkForUpdate() {
+  lastOtaCheck = millis();
+  otaCheckDue = false;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(8000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  if (!http.begin(client, OTA_VERSION_URL)) return;
+
+  int code = http.GET();
+  if (code == HTTP_CODE_OK) {
+    String v = http.getString();
+    v.trim();
+    if (isNewerVersion(v, FW_VERSION)) {
+      otaPending = true;
+      otaNewVersion = v;
+      Serial.printf("[OTA] Yeni surum var: %s (mevcut %s)\n", v.c_str(), FW_VERSION);
+    } else {
+      Serial.printf("[OTA] Guncel (%s)\n", FW_VERSION);
+    }
+  } else {
+    Serial.printf("[OTA] Surum kontrolu basarisiz, HTTP %d\n", code);
+  }
+  http.end();
+}
+
+void performUpdate() {
+  Serial.printf("[OTA] %s indiriliyor...\n", otaNewVersion.c_str());
+  lightState = false; currentSpeed = 0; applyOutputs();   // guvenli durum
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  httpUpdate.rebootOnUpdate(true);
+  t_httpUpdate_return ret = httpUpdate.update(client, OTA_FIRMWARE_URL);
+
+  // Buraya sadece hata olursa gelinir (basarida cihaz yeniden baslar)
+  if (ret == HTTP_UPDATE_FAILED) {
+    Serial.printf("[OTA] Hata (%d): %s\n", httpUpdate.getLastError(),
+                  httpUpdate.getLastErrorString().c_str());
+  }
+  otaPending = false;   // bir sonraki periyodik kontrolde tekrar denenir
+}
+
+void handleOta() {
+  if (netState != NET_ONLINE || WiFi.status() != WL_CONNECTED) return;
+
+  // Ag islemleri birkac saniye bloklar; sadece aspirator kapaliyken ve bir sure dokunulmamissa yap
+  bool idle = !lightState && currentSpeed == 0 && (millis() - lastActivityMs > OTA_IDLE_REQUIRED_MS);
+  if (!idle) return;
+
+  if (otaPending) { performUpdate(); return; }
+  if (otaCheckDue || millis() - lastOtaCheck > OTA_CHECK_INTERVAL_MS) checkForUpdate();
+}
+
+// Acilista LED'leri sirayla yakar: Isik > Hiz1 > Hiz2 > Hiz3
+// (Sadece LED'ler; triyaklara dokunmaz, motor/lamba calismaz)
+void ledSelfTest() {
+  const uint8_t order[4] = {PIN_LED_LIGHT, PIN_LED_SPEED[0], PIN_LED_SPEED[1], PIN_LED_SPEED[2]};
+  const char* names[4] = {"Isik", "Hiz 1", "Hiz 2", "Hiz 3"};
+  for (int i = 0; i < 4; i++) {
+    Serial.printf("[LED testi] %s LED'i (GPIO%d)\n", names[i], order[i]);
+    digitalWrite(order[i], LED_ON);
+    delay(400);
+    digitalWrite(order[i], LED_OFF);
+  }
+}
+
+// =====================================================================
+//  SETUP / LOOP
+// =====================================================================
+void setup() {
+  // Cikislari ILK is olarak guvenli seviyeye cek
+  initOutput(PIN_OUT_LIGHT, HIGH);
+  for (int i = 0; i < 3; i++) initOutput(PIN_OUT_SPEED[i], HIGH);
+  initOutput(PIN_LED_LIGHT, LED_OFF);
+  for (int i = 0; i < 3; i++) initOutput(PIN_LED_SPEED[i], LED_OFF);
+
+  btnLight.begin();
+  btnSpeed.begin();
+
+  Serial.begin(115200);
+  delay(200);
+  Serial.printf("\n[Aspirator] Surum %s\n", FW_VERSION);
+  ledSelfTest();
+
+  loadSettings();
+
+  wm.setConfigPortalBlocking(false);
+  wm.setSaveParamsCallback(onParamsSaved);
+  wm.setTitle("Akilli Aspirator");
+  std::vector<const char*> menu = {"wifi", "restart"};
+  wm.setMenu(menu);
+  wm.addParameter(&pAppKey);
+  wm.addParameter(&pAppSecret);
+  for (int i = 0; i < 4; i++) wm.addParameter(pDev[i]);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+
+  if (wm.getWiFiIsSaved()) startConnecting();
+  else                     startPortal(0);   // ilk kurulum: portal kurulum yapilana kadar acik
+
+  lastActivityMs = millis();
 }
 
 void loop() {
-  // Sadece internet baglantisi varsa SinricPro'yu dinle
-  if (WiFi.status() == WL_CONNECTED) {
-    SinricPro.handle();
+  // --- Fiziksel tuslar (internetten bagimsiz, her zaman calisir) ---
+  switch (btnLight.update()) {
+    case TouchButton::SHORT_PRESS:
+      lightState = !lightState;
+      applyOutputs();
+      break;
+    case TouchButton::LONG_PRESS:
+      factoryReset();
+      break;
+    default: break;
   }
 
-  // --- FİZİKSEL BUTON KONTROLLERİ ---
-  if (btnLight.onRelease()) {
-    lightState = !lightState;
-    updateHardwareAndCloud();
+  if (btnSpeed.update() == TouchButton::SHORT_PRESS) {
+    currentSpeed = (currentSpeed + 1) % 4;   // 0 > 1 > 2 > 3 > 0
+    applyOutputs();
   }
 
-  if (btnSpeedCycle.onRelease()) {
-    currentSpeed++;
-    if (currentSpeed > 3) currentSpeed = 0; 
-    updateHardwareAndCloud();
-  }
+  // --- Ag / bulut ---
+  handleNetwork();
+  if (sinricStarted && WiFi.status() == WL_CONNECTED) SinricPro.handle();
+  syncCloud();
+  handleOta();
 }
