@@ -46,8 +46,8 @@ const char* SPEED_SETTING_ID = "id_fan_speed";
 // ================== SURUM & OTA ==================
 // Her yeni surumde BURAYI ve GitHub'daki version.txt'yi ayni degere guncelle.
 #define FW_VERSION "1.1.0"
-const char* OTA_VERSION_URL  = "https://raw.githubusercontent.com/KULLANICI/Aspirator/main/version.txt";
-const char* OTA_FIRMWARE_URL = "https://raw.githubusercontent.com/KULLANICI/Aspirator/main/firmware.bin";
+const char* OTA_VERSION_URL  = "https://raw.githubusercontent.com/kubilayatas/Aspirator/main/version.txt";
+const char* OTA_FIRMWARE_URL = "https://raw.githubusercontent.com/kubilayatas/Aspirator/main/firmware.bin";
 const unsigned long OTA_CHECK_INTERVAL_MS = 6UL * 60UL * 60UL * 1000UL;  // 6 saatte bir kontrol
 const unsigned long OTA_IDLE_REQUIRED_MS  = 60UL * 1000UL;               // cihaz 1 dk bostaysa guncelle
 
