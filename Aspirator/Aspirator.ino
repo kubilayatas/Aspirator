@@ -2,6 +2,10 @@
  * Akilli Aspirator - ESP32-C3 Super Mini
  * SinricPro (Google Home / Alexa / Siri) + WiFiManager + GitHub OTA
  *
+ * SinricPro'da TEK cihaz kullanilir:
+ *   - Power (Ac/Kapat)        -> Isik
+ *   - Setting "fan speed"     -> Motor hizi (0: kapali, 1, 2, 3)
+ *
  * Arduino IDE ayarlari:
  *   Board            : ESP32C3 Dev Module   (Nologo Super Mini menusunde OTA'li buyuk sema yok)
  *   Partition Scheme : No FS 4MB (2MB APP x2)   veya   Minimal SPIFFS (1.9MB APP with OTA)
@@ -20,9 +24,28 @@
 #include <SinricProSwitch.h>
 #include "driver/gpio.h"
 
+// ================== GIZLI BILGILER ==================
+// secrets.h repoya GIRMEZ (.gitignore). Yoksa veya EMBED_SECRETS 0 ise bilgiler
+// sadece kurulum portalindan alinir.
+// !!! GitHub'a OTA icin firmware.bin cikarmadan once EMBED_SECRETS'i 0 yap,
+// !!! yoksa APP SECRET .bin dosyasinin icinde okunabilir halde yayinlanir.
+#define EMBED_SECRETS 1
+
+#if EMBED_SECRETS && __has_include("secrets.h")
+  #include "secrets.h"
+#else
+  #define SECRET_APP_KEY    ""
+  #define SECRET_APP_SECRET ""
+  #define SECRET_DEVICE_ID  ""
+#endif
+
+// SinricPro portalinda olusturdugun hiz ayarinin ID'si (portaldaki "ID" alani).
+// Emin degilsen uygulamadan hizi bir kez degistir; seri monitor gelen ID'yi yazar.
+const char* SPEED_SETTING_ID = "id_fan_speed";
+
 // ================== SURUM & OTA ==================
 // Her yeni surumde BURAYI ve GitHub'daki version.txt'yi ayni degere guncelle.
-#define FW_VERSION "1.0.0"
+#define FW_VERSION "1.1.0"
 const char* OTA_VERSION_URL  = "https://raw.githubusercontent.com/KULLANICI/Aspirator/main/version.txt";
 const char* OTA_FIRMWARE_URL = "https://raw.githubusercontent.com/KULLANICI/Aspirator/main/firmware.bin";
 const unsigned long OTA_CHECK_INTERVAL_MS = 6UL * 60UL * 60UL * 1000UL;  // 6 saatte bir kontrol
@@ -35,11 +58,10 @@ const uint8_t PIN_BTN_SPEED = 3;   // TTP224 kanal 2 -> dongusel hiz (0>1>2>3>0)
 
 const uint8_t PIN_OUT_LIGHT = 6;                 // Triyak, Active-LOW
 const uint8_t PIN_OUT_SPEED[3] = {7, 10, 21};    // Triyak, Active-LOW
-const uint8_t PIN_LED_LIGHT = 0;                 // LED, Active-HIGH
-const uint8_t PIN_LED_SPEED[3] = {1, 20, 8};     // LED, Active-HIGH
+const uint8_t PIN_LED_LIGHT = 0;                 // LED, Active-LOW
+const uint8_t PIN_LED_SPEED[3] = {1, 20, 8};     // LED, Active-LOW
 
-// LED'ler anot ESP'ye (katot GND'ye) bagliysa HIGH yanar. Test sirasinda LED'ler
-// "ters" davraniyorsa (yanmasi gerekirken sonuk, sonmesi gerekirken yanik) bu iki satiri yer degistir.
+// Panel LED'leri Active-LOW (pin LOW olunca yanar) - olculerek dogrulandi.
 #define LED_ON   LOW
 #define LED_OFF  HIGH
 
@@ -61,24 +83,20 @@ unsigned long lastActivityMs = 0;
 
 // ================== AYARLAR (NVS) ==================
 Preferences prefs;
-String appKey, appSecret, devId[4];   // 0: isik, 1-3: hizlar
-const char* PREF_KEYS[4] = {"lightId", "spd1Id", "spd2Id", "spd3Id"};
+String appKey, appSecret, deviceId;
 
 WiFiManager wm;
-WiFiManagerParameter pAppKey   ("b1b4f628-f682-4fc1-ad87-a3e2474cd799",    "SinricPro APP KEY",    "", 64);
-WiFiManagerParameter pAppSecret("fc358aba-dd6d-4902-88e1-5b8f9a708595-808b75f4-28d5-4ff5-864a-ff3801a2b194", "SinricPro APP SECRET", "", 128);
-WiFiManagerParameter pDev0     ("6abdf7b5a60031348f5d4be1",   "Isik Device ID",       "", 40);
-WiFiManagerParameter pDev1     ("spd1Id",    "Hiz 1 Device ID",      "", 40);
-WiFiManagerParameter pDev2     ("spd2Id",    "Hiz 2 Device ID",      "", 40);
-WiFiManagerParameter pDev3     ("spd3Id",    "Hiz 3 Device ID",      "", 40);
-WiFiManagerParameter* pDev[4] = {&pDev0, &pDev1, &pDev2, &pDev3};
+// 1. argüman formdaki alanin ADI'dir (deger degil); degerler NVS'den / secrets.h'den gelir.
+WiFiManagerParameter pAppKey   ("appKey",    "SinricPro APP KEY",    "", 64);
+WiFiManagerParameter pAppSecret("appSecret", "SinricPro APP SECRET", "", 128);
+WiFiManagerParameter pDeviceId ("deviceId",  "SinricPro Device ID",  "", 40);
 bool paramsChanged = false;
 
 // ================== SINRICPRO ==================
-SinricProSwitch* devs[4] = {nullptr, nullptr, nullptr, nullptr};
+SinricProSwitch* sinricDev = nullptr;
 bool sinricStarted = false;
-bool reported[4];
-bool reportValid[4] = {false, false, false, false};
+bool reportedLight = false, lightReportValid = false;
+int  reportedSpeed = 0;     bool speedReportValid = false;
 
 // ================== AG DURUM MAKINESI ==================
 enum NetState { NET_CONNECTING, NET_PORTAL, NET_ONLINE };
@@ -178,68 +196,78 @@ void applyOutputs() {
 // =====================================================================
 //  SINRICPRO
 // =====================================================================
-bool desiredState(int i) { return (i == 0) ? lightState : (currentSpeed == i); }
-
-// Sadece degisen durumlari gonderir. SinricPro cihaz basina saniyede 1 olay
+// Sadece degisen durumlari gonderir. SinricPro her olay tipi icin saniyede 1 olay
 // sinirina sahip; gonderilemeyen olay kaybolmaz, sonraki denemede gider.
 void syncCloud() {
-  if (!sinricStarted || WiFi.status() != WL_CONNECTED || !SinricPro.isConnected()) return;
+  if (!sinricStarted || !sinricDev || WiFi.status() != WL_CONNECTED || !SinricPro.isConnected()) return;
   static unsigned long lastTry = 0;
   if (millis() - lastTry < 200) return;
   lastTry = millis();
 
-  for (int i = 0; i < 4; i++) {
-    if (!devs[i]) continue;
-    bool want = desiredState(i);
-    if (reportValid[i] && reported[i] == want) continue;
-    if (devs[i]->sendPowerStateEvent(want)) {
-      reported[i] = want;
-      reportValid[i] = true;
+  if (!lightReportValid || reportedLight != lightState) {
+    if (sinricDev->sendPowerStateEvent(lightState)) {
+      reportedLight = lightState; lightReportValid = true;
+    }
+  }
+  if (!speedReportValid || reportedSpeed != currentSpeed) {
+    if (sinricDev->sendSettingEvent(SPEED_SETTING_ID, currentSpeed)) {
+      reportedSpeed = currentSpeed; speedReportValid = true;
     }
   }
 }
 
-bool onLightPower(const String& deviceId, bool& state) {
+// Uygulama / asistan: Ac-Kapat -> isik
+bool onPowerState(const String&, bool& state) {
   lightState = state;
   applyOutputs();
-  reported[0] = state; reportValid[0] = true;   // cevap zaten bu durumu bildiriyor
+  reportedLight = state; lightReportValid = true;   // cevap zaten bu durumu bildiriyor
   return true;
 }
 
-bool handleSpeedPower(int n, bool& state) {
-  if (state) currentSpeed = n;                     // radyo buton: digerleri duser
-  else if (currentSpeed == n) currentSpeed = 0;
+// Uygulama: hiz ayari (0-3) -> motor
+bool onSetting(const String&, const String& settingId, SettingValue& value) {
+  int v;
+  if      (std::holds_alternative<int>(value))    v = std::get<int>(value);
+  else if (std::holds_alternative<float>(value))  v = (int)lroundf(std::get<float>(value));  // sayilar float gelebilir
+  else if (std::holds_alternative<String>(value)) v = std::get<String>(value).toInt();
+  else {
+    Serial.printf("[Sinric] Ayar '%s' desteklenmeyen tipte\n", settingId.c_str());
+    return false;
+  }
+  Serial.printf("[Sinric] Ayar geldi: id='%s' deger=%d\n", settingId.c_str(), v);
+
+  if (settingId != SPEED_SETTING_ID) {
+    Serial.printf("[Sinric] Bilinmeyen ayar ID'si. Koddaki SPEED_SETTING_ID'yi \"%s\" yap.\n", settingId.c_str());
+    return false;
+  }
+  if (v < 0 || v > 3) return false;
+
+  currentSpeed = v;
   applyOutputs();
-  reported[n] = state; reportValid[n] = true;
-  return true;                                     // diger hizlarin "kapali" bilgisi syncCloud ile gider
+  value = v;                                        // cevapta tam sayi donsun
+  reportedSpeed = v; speedReportValid = true;
+  return true;
 }
 
 bool credentialsValid() {
-  if (appKey.length() < 30 || appSecret.length() < 30) return false;
-  for (int i = 0; i < 4; i++) if (devId[i].length() < 20) return false;
-  return true;
+  return appKey.length() >= 30 && appSecret.length() >= 30 && deviceId.length() >= 20;
 }
 
 void startSinric() {
-  if (sinricStarted || !credentialsValid()) {
-    if (!credentialsValid()) Serial.println("[Sinric] Bilgiler eksik, sadece yerel calisma.");
+  if (sinricStarted) return;
+  if (!credentialsValid()) {
+    Serial.println("[Sinric] Bilgiler eksik, sadece yerel calisma.");
     return;
   }
   // SinricPro[id] gecici bir Proxy dondurur; referansa baglamak onu gercek cihaza cevirir.
-  SinricProSwitch& light = SinricPro[devId[0]];
-  SinricProSwitch& s1    = SinricPro[devId[1]];
-  SinricProSwitch& s2    = SinricPro[devId[2]];
-  SinricProSwitch& s3    = SinricPro[devId[3]];
-  devs[0] = &light; devs[1] = &s1; devs[2] = &s2; devs[3] = &s3;
-
-  light.onPowerState(onLightPower);
-  s1.onPowerState([](const String&, bool& st) { return handleSpeedPower(1, st); });
-  s2.onPowerState([](const String&, bool& st) { return handleSpeedPower(2, st); });
-  s3.onPowerState([](const String&, bool& st) { return handleSpeedPower(3, st); });
+  SinricProSwitch& dev = SinricPro[deviceId];
+  sinricDev = &dev;
+  dev.onPowerState(onPowerState);
+  dev.onSetSetting(onSetting);
 
   SinricPro.onConnected([]() {
     Serial.println("[Sinric] Baglandi");
-    for (int i = 0; i < 4; i++) reportValid[i] = false;   // yeniden baglaninca tum durumu esitle
+    lightReportValid = false; speedReportValid = false;   // yeniden baglaninca durumu esitle
   });
   SinricPro.onDisconnected([]() { Serial.println("[Sinric] Baglanti koptu"); });
 
@@ -253,13 +281,14 @@ void startSinric() {
 // =====================================================================
 void loadSettings() {
   prefs.begin("aspirator", false);
-  appKey    = prefs.getString("appKey", "");
-  appSecret = prefs.getString("appSecret", "");
-  for (int i = 0; i < 4; i++) devId[i] = prefs.getString(PREF_KEYS[i], "");
+  // NVS bossa secrets.h'deki degerler varsayilan olur
+  appKey    = prefs.getString("appKey",    SECRET_APP_KEY);
+  appSecret = prefs.getString("appSecret", SECRET_APP_SECRET);
+  deviceId  = prefs.getString("deviceId",  SECRET_DEVICE_ID);
 
   pAppKey.setValue(appKey.c_str(), 64);
   pAppSecret.setValue(appSecret.c_str(), 128);
-  for (int i = 0; i < 4; i++) pDev[i]->setValue(devId[i].c_str(), 40);
+  pDeviceId.setValue(deviceId.c_str(), 40);
 }
 
 String cleanParam(WiFiManagerParameter& p) {
@@ -270,17 +299,13 @@ String cleanParam(WiFiManagerParameter& p) {
 
 // Portalda "Save" basilinca WiFiManager cagirir
 void onParamsSaved() {
-  String k = cleanParam(pAppKey), s = cleanParam(pAppSecret), d[4];
-  for (int i = 0; i < 4; i++) d[i] = cleanParam(*pDev[i]);
+  String k = cleanParam(pAppKey), s = cleanParam(pAppSecret), d = cleanParam(pDeviceId);
+  if (k == appKey && s == appSecret && d == deviceId) return;
 
-  bool changed = (k != appKey) || (s != appSecret);
-  for (int i = 0; i < 4; i++) changed |= (d[i] != devId[i]);
-  if (!changed) return;
-
-  appKey = k; appSecret = s;
+  appKey = k; appSecret = s; deviceId = d;
   prefs.putString("appKey", appKey);
   prefs.putString("appSecret", appSecret);
-  for (int i = 0; i < 4; i++) { devId[i] = d[i]; prefs.putString(PREF_KEYS[i], devId[i]); }
+  prefs.putString("deviceId", deviceId);
   paramsChanged = true;
   Serial.println("[Ayar] SinricPro bilgileri kaydedildi");
 }
@@ -468,7 +493,7 @@ void setup() {
   wm.setMenu(menu);
   wm.addParameter(&pAppKey);
   wm.addParameter(&pAppSecret);
-  for (int i = 0; i < 4; i++) wm.addParameter(pDev[i]);
+  wm.addParameter(&pDeviceId);
 
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
