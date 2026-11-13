@@ -1,17 +1,25 @@
 /*
  * Akilli Aspirator - ESP32-C3 Super Mini
- * SinricPro (Google Home / Alexa / Siri) + WiFiManager + GitHub OTA
+ * SinricPro (SmartThings / Google Home / Alexa) + WiFiManager + GitHub OTA
  *
- * SinricPro'da TEK cihaz kullanilir:
- *   - Power (Ac/Kapat)        -> Isik
- *   - Setting "fan speed"     -> Motor hizi (0: kapali, 1, 2, 3)
+ * SinricPro'da IKI cihaz kullanilir (SmartThings ve asistanlar sadece standart
+ * cihaz tiplerini tanidigi icin hiz, Fan cihazinin kendi hiz ayari uzerinden gelir):
+ *   - "Switch" tipi cihaz  -> Isik (ac/kapat)
+ *   - "Fan" tipi cihaz     -> Motor: ac/kapat + hiz 1..3
+ *     Fan acilinca en son kullanilan hizda baslar; kapaliyken hiz secilirse fan acilir.
  *
- * Fiziksel tuslar:
- *   - Isik tusu kisa  : isik ac/kapat
- *   - Isik tusu 8 sn  : fabrika ayari (WiFi + SinricPro bilgileri silinir)
- *   - Hiz tusu kisa   : 0 > 1 > 2 > 3 > 0
- *   - Hiz tusu 5 sn   : kurulum agini (portal) 3 dk icin ac -> WiFi'yi ya da
- *                       SinricPro bilgilerini sifirlamadan degistirmek icin
+ * Fiziksel tuslar (TTP224, 4 kanal). Her islem tus BIRAKILINCA yapilir:
+ *   - T1 Isik   kisa : isik ac/kapat
+ *   - T1 Isik   8 sn : fabrika ayari (WiFi + SinricPro bilgileri silinir)
+ *   - T2 Hiz 1  kisa : hiz 1 (zaten 1'deyse motor kapanir)
+ *   - T2 Hiz 1  5 sn : kurulum agini (portal) 3 dk icin ac -> WiFi'yi ya da
+ *                      SinricPro bilgilerini sifirlamadan degistirmek icin
+ *   - T3 Hiz 2  kisa : hiz 2 (zaten 2'deyse motor kapanir)
+ *   - T4 Hiz 3  kisa : hiz 3 (zaten 3'teyse motor kapanir)
+ *   Uzun basma esigi gecilince tum LED'ler yanar: "simdi birakabilirsin" demektir.
+ *   Ayni anda birden fazla tusa dokunulursa basma iptal edilir; tum tuslar
+ *   birakilana kadar hicbir sey yapilmaz. 20 sn'den uzun basili kalan (takilan)
+ *   kanal birakilana kadar yok sayilir, diger tuslar calismaya devam eder.
  *
  * Arduino IDE ayarlari:
  *   Board            : ESP32C3 Dev Module   (Nologo Super Mini menusunde OTA'li buyuk sema yok)
@@ -20,11 +28,10 @@
  *
  * Test edilen surumler: esp32 core 3.3.2, SinricPro 5.1.0, WiFiManager 2.0.17
  *
- * DONANIM NOTU: GPIO21 = UART0 TX. ESP32-C3'un ROM'u acilista (setup() calismadan
- * once, ~100 ms) boot mesajlarini bu pinden basar; pin bu sirada LOW-HIGH darbeler
- * gorur ve Active-LOW surulen 3. hiz triyagi kisa sure tetiklenebilir. Acilista motor
- * bir an "silkiniyorsa" sebep budur; 3. hiz triyagini GPIO21 yerine bir LED pinine
- * (orn. GPIO1) alip LED'i GPIO21'e tasimak kalici cozumdur.
+ * PIN NOTU: GPIO21 (UART0 TX) acilista ROM boot mesajlariyla darbelenir; bu yuzden
+ * orada triyak degil sadece bir LED var (acilista bir an kirpisabilir, zararsiz).
+ * GPIO8/GPIO9 strapping pinleridir; GPIO8'de sadece LED (kart LED'i de orada),
+ * GPIO9 (BOOT tusu) bos birakildi.
  */
 
 #include <WiFi.h>
@@ -35,7 +42,16 @@
 #include <WiFiClientSecure.h>
 #include <SinricPro.h>
 #include <SinricProSwitch.h>
+#include <SinricProFanUS.h>
 #include "driver/gpio.h"
+
+// Hiz 1 ve Hiz 2 LED'leri GPIO21/GPIO20'de; bunlar ayni zamanda UART0 TX/RX pinleri.
+// "USB CDC On Boot: Disabled" iken Serial UART0'i kullanir ve bu iki pini ele gecirir:
+// Hiz 2 LED'i hic yanmaz, Hiz 1 LED'i her seri mesajda kisa yanip soner.
+// Bu yuzden Enabled secilmeden derlenmesin.
+#if !ARDUINO_USB_CDC_ON_BOOT
+  #error "Arduino IDE > Tools > USB CDC On Boot: 'Enabled' secmelisin (Disabled iken Serial GPIO20/21'deki LED'leri bozar)"
+#endif
 
 // ================== GIZLI BILGILER ==================
 // secrets.h repoya GIRMEZ (.gitignore). EMBED_SECRETS 0 iken SinricPro bilgileri
@@ -56,11 +72,18 @@
   #undef  SECRET_APP_KEY
   #undef  SECRET_APP_SECRET
   #undef  SECRET_DEVICE_ID
+  #undef  SECRET_FAN_ID
   #define SECRET_APP_KEY    ""
   #define SECRET_APP_SECRET ""
   #define SECRET_DEVICE_ID  ""
 #else
   #warning "EMBED_SECRETS=1: SinricPro APP SECRET bu derlemenin icinde. Bu .bin dosyasini GitHub'a KOYMA!"
+#endif
+
+// SECRET_DEVICE_ID = Isik (Switch) cihazi, SECRET_FAN_ID = Motor (Fan) cihazi.
+// Eski secrets.h'de SECRET_FAN_ID yoksa bos kabul edilir; portalin Setup sayfasindan da girilebilir.
+#ifndef SECRET_FAN_ID
+  #define SECRET_FAN_ID ""
 #endif
 
 // Kurulum agi (Aspirator_Kurulum) sifresi. En az 8 karakter olmali.
@@ -69,14 +92,15 @@
   #define SECRET_AP_PASS "aspirator"
 #endif
 
-// SinricPro portalinda olusturdugun hiz ayarinin ID'si (portaldaki "ID" alani).
-// Emin degilsen uygulamadan hizi bir kez degistir; seri monitor gelen ID'yi yazar.
-const char* SPEED_SETTING_ID = "id_fan_speed";
+// WiFi verici gucunu dusur (19.5 dBm yerine 8.5 dBm). WiFi yayini sirasindaki akim
+// darbelerini azaltir; zayif besleme yuzunden resetlenen ya da agi zor bulan Super Mini
+// kartlarda ise yarar. Bedeli: kapsama alani kisalir. Router uzaksa 0 birak.
+#define WIFI_LOW_TX_POWER 1
 
 // ================== SURUM & OTA ==================
 // Her yeni surumde BURAYI ve GitHub'daki version.txt'yi ayni degere guncelle.
 // Yayinlarken ONCE firmware.bin'i, SONRA version.txt'yi yukle.
-#define FW_VERSION "1.2.0"
+#define FW_VERSION "1.4.0"
 const char* OTA_VERSION_URL  = "https://raw.githubusercontent.com/kubilayatas/Aspirator/main/version.txt";
 const char* OTA_FIRMWARE_URL = "https://raw.githubusercontent.com/kubilayatas/Aspirator/main/firmware.bin";
 const unsigned long OTA_CHECK_INTERVAL_MS = 6UL * 60UL * 60UL * 1000UL;  // 6 saatte bir kontrol
@@ -84,14 +108,15 @@ const unsigned long OTA_IDLE_REQUIRED_MS  = 60UL * 1000UL;               // ciha
 const int           OTA_MAX_TRIES         = 3;   // ayni surum bu kadar denenip tutmazsa birakilir
 
 // ================== PINLER ==================
-const uint8_t PIN_BTN_LIGHT = 2;   // TTP224 kanal 1
-const uint8_t PIN_BTN_SPEED = 3;   // TTP224 kanal 2 -> dongusel hiz (0>1>2>3>0)
-// GPIO 4 ve 5 (arizali / yedek kanallar) bilerek kullanilmiyor.
+// Dokunmatik tuslar: TTP224 OUT1..OUT4 (varsayilan mod: dokununca HIGH, birakinca LOW)
+enum Key { KEY_LIGHT = 0, KEY_SPEED1 = 1, KEY_SPEED2 = 2, KEY_SPEED3 = 3, KEY_COUNT = 4 };
+const uint8_t PIN_TOUCH[KEY_COUNT] = {2, 3, 4, 5};   // T1 Isik, T2 Hiz1, T3 Hiz2, T4 Hiz3
+const char*   KEY_NAMES[KEY_COUNT] = {"Isik", "Hiz 1", "Hiz 2", "Hiz 3"};
 
 const uint8_t PIN_OUT_LIGHT = 6;                 // Triyak, Active-LOW
-const uint8_t PIN_OUT_SPEED[3] = {7, 10, 21};    // Triyak, Active-LOW  (GPIO21 icin ust nota bak)
+const uint8_t PIN_OUT_SPEED[3] = {7, 10, 1};     // Triyak, Active-LOW  (Hiz1, Hiz2, Hiz3)
 const uint8_t PIN_LED_LIGHT = 0;                 // LED, Active-LOW
-const uint8_t PIN_LED_SPEED[3] = {1, 20, 8};     // LED, Active-LOW
+const uint8_t PIN_LED_SPEED[3] = {21, 20, 8};    // LED, Active-LOW     (Hiz1, Hiz2, Hiz3)
 
 // Panel LED'leri Active-LOW (pin LOW olunca yanar) - olculerek dogrulandi.
 #define LED_ON   LOW
@@ -99,8 +124,11 @@ const uint8_t PIN_LED_SPEED[3] = {1, 20, 8};     // LED, Active-LOW
 
 // ================== ZAMANLAMALAR ==================
 const unsigned long DEBOUNCE_MS           = 50;
-const unsigned long FACTORY_RESET_HOLD_MS = 8000;    // Isik tusuna 8 sn basili tut -> fabrika ayari
-const unsigned long PORTAL_HOLD_MS        = 5000;    // Hiz tusuna 5 sn basili tut -> kurulum portali
+const unsigned long FACTORY_RESET_HOLD_MS = 8000;    // Isik tusu 8 sn basili + birak -> fabrika ayari
+const unsigned long PORTAL_HOLD_MS        = 5000;    // Hiz 1 tusu 5 sn basili + birak -> kurulum portali
+const unsigned long KEY_STUCK_MS          = 20000;   // Bundan uzun basili kalan kanal "takili" sayilir
+// Her tusun uzun basma esigi (0 = uzun basma islevi yok, ne kadar basili tutulsa da kisa basma sayilir)
+const unsigned long LONG_PRESS_MS[KEY_COUNT] = {FACTORY_RESET_HOLD_MS, PORTAL_HOLD_MS, 0, 0};
 const unsigned long SPEED_DEADTIME_MS     = 30;      // Hiz degisiminde iki sargi ayni anda enerjilenmesin
 const unsigned long WIFI_CONNECT_TIMEOUT  = 30000;   // Kayitli aga baglanma denemesi
 const unsigned long PORTAL_TIMEOUT_S      = 180;     // Kayitli ag varken portal ne kadar acik kalsin
@@ -114,11 +142,12 @@ const char* AP_PASS = SECRET_AP_PASS;
 bool lightState   = false;
 int  currentSpeed = 0;     // istenen hiz
 int  appliedSpeed = 0;     // donanimda su an uygulanan hiz
+int  lastOnSpeed  = 1;     // fan "ac" komutu gelince kullanilacak son hiz
 unsigned long lastActivityMs = 0;
 
 // ================== AYARLAR (NVS) ==================
 Preferences prefs;
-String appKey, appSecret, deviceId;
+String appKey, appSecret, lightId, fanId;   // lightId NVS'de "deviceId" anahtariyla durur (eski surumle uyumlu)
 
 WiFiManager wm;
 // 1. arguman formdaki alanin ADI'dir (deger degil); degerler NVS'den / secrets.h'den gelir.
@@ -126,15 +155,18 @@ WiFiManager wm;
 WiFiManagerParameter pAppKey   ("appKey",    "SinricPro APP KEY",    "", 64);
 WiFiManagerParameter pAppSecret("appSecret", "SinricPro APP SECRET", "", 128,
                                 "placeholder='Bos birakirsan mevcut deger korunur'");
-WiFiManagerParameter pDeviceId ("deviceId",  "SinricPro Device ID",  "", 40);
+WiFiManagerParameter pLightId  ("deviceId",  "Isik cihazi Device ID (Switch)", "", 40);
+WiFiManagerParameter pFanId    ("fanId",     "Motor cihazi Device ID (Fan)",   "", 40);
 bool paramsChanged = false;
 unsigned long paramsChangedAt = 0;
 
 // ================== SINRICPRO ==================
-SinricProSwitch* sinricDev = nullptr;
+SinricProSwitch* lightDev = nullptr;
+SinricProFanUS*  fanDev   = nullptr;
 bool sinricStarted = false;
-bool reportedLight = false, lightReportValid = false;
-int  reportedSpeed = 0;     bool speedReportValid = false;
+bool reportedLight = false,    lightReportValid = false;
+bool reportedFanOn = false,    fanPowerReportValid = false;
+int  reportedFanSpeed = 0;     bool fanSpeedReportValid = false;
 
 // ================== AG DURUM MAKINESI ==================
 enum NetState { NET_CONNECTING, NET_PORTAL, NET_ONLINE };
@@ -149,52 +181,112 @@ bool otaPending = false;
 String otaNewVersion;
 
 // =====================================================================
-//  DOKUNMATIK TUS (debounce + kisa basma + uzun basma)
+//  DOKUNMATIK PANEL (4 tus, ayni anda tek tus, islem birakinca)
 // =====================================================================
-class TouchButton {
+// Kurallar:
+//  - Her kanal ayri ayri debounce edilir.
+//  - Tum tuslar bosken TEK bir tusa basilirsa o tus "aday" olur.
+//  - Aday basiliyken baska bir tusa da dokunulursa basma IPTAL edilir ve tum tuslar
+//    birakilana kadar hicbir sey kabul edilmez (iki tusa birden basmak = hicbir sey).
+//  - Islem ancak aday tus birakildiginda ve o an baska tus basili degilken uretilir.
+//    Basili kalma suresi uzun basma esigini gectiyse LONG, gecmediyse SHORT olur.
+//  - Acilista basili gorunen ya da KEY_STUCK_MS'den uzun basili kalan kanal "takili"
+//    sayilir; o kanal birakilana kadar yok sayilir, diger tuslar calismaya devam eder.
+class TouchPanel {
   public:
-    enum Event { NONE, SHORT_PRESS, LONG_PRESS };
-    TouchButton(uint8_t p, unsigned long holdMs) : pin(p), longMs(holdMs) {}
-    void begin() { pinMode(pin, INPUT); }
+    enum Type { NONE, SHORT_PRESS, LONG_PRESS };
+    struct Event { Type type; int key; };
 
-    Event update() {
-      bool raw = digitalRead(pin) == HIGH;
+    void begin() {
       unsigned long now = millis();
-      if (raw != lastRaw) { lastRaw = raw; lastChange = now; }
-      if (now - lastChange < DEBOUNCE_MS) return NONE;
-      if (!raw && !stable) armed = true;   // tus bos gorulduyse hemen hazir
-
-      if (raw != stable) {
-        stable = raw;
-        if (!stable) {                       // birakildi
-          bool wasArmedPress = armed && pressed;
-          armed = true;                      // tus en az bir kez bos goruldu
-          pressed = false;
-          if (wasArmedPress && !longFired) return SHORT_PRESS;
-          return NONE;
-        }
-        pressed = true;                      // basildi
-        pressStart = now;
-        longFired = false;
-        return NONE;
+      for (int i = 0; i < KEY_COUNT; i++) {
+        pinMode(PIN_TOUCH[i], INPUT);
+        raw[i] = stable[i] = (digitalRead(PIN_TOUCH[i]) == HIGH);
+        changedAt[i] = now;
+        blocked[i] = stable[i];                  // acilista basili -> birakilana kadar yok say
+        if (blocked[i]) Serial.printf("[Tus] %s acilista basili, birakilana kadar yok sayiliyor\n", KEY_NAMES[i]);
       }
-      if (armed && pressed && !longFired && now - pressStart >= longMs) {
-        longFired = true;
-        return LONG_PRESS;
-      }
-      return NONE;
     }
 
+    Event update() {
+      unsigned long now = millis();
+
+      // 1) Her kanali debounce et
+      for (int i = 0; i < KEY_COUNT; i++) {
+        bool r = digitalRead(PIN_TOUCH[i]) == HIGH;
+        if (r != raw[i]) { raw[i] = r; changedAt[i] = now; }
+        if (stable[i] != raw[i] && now - changedAt[i] >= DEBOUNCE_MS) {
+          stable[i] = raw[i];
+          if (!stable[i] && blocked[i]) {
+            blocked[i] = false;
+            Serial.printf("[Tus] %s birakildi, tekrar aktif\n", KEY_NAMES[i]);
+          }
+        }
+      }
+
+      // 2) Gecerli (takili olmayan) basili tuslari say
+      int count = 0, which = -1;
+      for (int i = 0; i < KEY_COUNT; i++)
+        if (stable[i] && !blocked[i]) { count++; which = i; }
+
+      // 3) Durum makinesi
+      switch (state) {
+        case IDLE:
+          if (count == 1) {
+            state = HOLD; active = which; pressStart = now; longReached = false;
+          } else if (count > 1) {
+            state = CANCELLED;
+            Serial.println("[Tus] Ayni anda birden fazla tus, yok sayildi");
+          }
+          break;
+
+        case HOLD: {
+          if (count > 1 || (count == 1 && which != active)) {
+            state = CANCELLED; longReached = false;
+            Serial.println("[Tus] Basiliyken baska tusa dokunuldu, iptal");
+            break;
+          }
+          unsigned long held = now - pressStart;
+          if (count == 0) {                       // aday tus birakildi -> islem
+            state = IDLE;
+            bool isLong = LONG_PRESS_MS[active] > 0 && held >= LONG_PRESS_MS[active];
+            longReached = false;
+            return { isLong ? LONG_PRESS : SHORT_PRESS, active };
+          }
+          if (held >= KEY_STUCK_MS) {             // cok uzun basili: takili kanal
+            blocked[active] = true;
+            state = CANCELLED; longReached = false;
+            Serial.printf("[Tus] %s %lu sn'dir basili, takili sayildi\n", KEY_NAMES[active], KEY_STUCK_MS / 1000);
+            break;
+          }
+          if (!longReached && LONG_PRESS_MS[active] > 0 && held >= LONG_PRESS_MS[active]) {
+            longReached = true;
+            Serial.printf("[Tus] %s uzun basma esigi gecildi, birakinca uygulanacak\n", KEY_NAMES[active]);
+          }
+          break;
+        }
+
+        case CANCELLED:
+          if (count == 0) state = IDLE;          // hepsi birakilinca yeniden hazir
+          break;
+      }
+      return { NONE, -1 };
+    }
+
+    // Uzun basma esigi gecildi ve tus hala basili mi? (LED geri bildirimi icin)
+    bool longReady() const { return state == HOLD && longReached; }
+
   private:
-    uint8_t pin;
-    unsigned long longMs;
-    bool lastRaw = false, stable = false, pressed = false, longFired = false;
-    bool armed = false;   // acilista takili (surekli HIGH) kanal yanlislikla uzun basma uretmesin
-    unsigned long lastChange = 0, pressStart = 0;
+    enum State { IDLE, HOLD, CANCELLED };
+    State state = IDLE;
+    int active = -1;
+    bool longReached = false;
+    unsigned long pressStart = 0;
+    bool raw[KEY_COUNT] = {}, stable[KEY_COUNT] = {}, blocked[KEY_COUNT] = {};
+    unsigned long changedAt[KEY_COUNT] = {};
 };
 
-TouchButton btnLight(PIN_BTN_LIGHT, FACTORY_RESET_HOLD_MS);
-TouchButton btnSpeed(PIN_BTN_SPEED, PORTAL_HOLD_MS);
+TouchPanel panel;
 
 // =====================================================================
 //  DONANIM
@@ -247,6 +339,7 @@ void applyOutputs() {
     }
     appliedSpeed = currentSpeed;
   }
+  if (currentSpeed > 0) lastOnSpeed = currentSpeed;
   lastActivityMs = millis();
 }
 
@@ -256,75 +349,109 @@ void applyOutputs() {
 // Sadece degisen durumlari gonderir. SinricPro her olay tipi icin saniyede 1 olay
 // sinirina sahip; gonderilemeyen olay kaybolmaz, sonraki denemede gider.
 void syncCloud() {
-  if (!sinricStarted || !sinricDev || WiFi.status() != WL_CONNECTED || !SinricPro.isConnected()) return;
+  if (!sinricStarted || WiFi.status() != WL_CONNECTED || !SinricPro.isConnected()) return;
   static unsigned long lastTry = 0;
   if (millis() - lastTry < 200) return;
   lastTry = millis();
 
-  if (!lightReportValid || reportedLight != lightState) {
-    if (sinricDev->sendPowerStateEvent(lightState)) {
+  if (lightDev && (!lightReportValid || reportedLight != lightState)) {
+    if (lightDev->sendPowerStateEvent(lightState)) {
       reportedLight = lightState; lightReportValid = true;
     }
   }
-  if (!speedReportValid || reportedSpeed != currentSpeed) {
-    if (sinricDev->sendSettingEvent(SPEED_SETTING_ID, currentSpeed)) {
-      reportedSpeed = currentSpeed; speedReportValid = true;
+
+  if (fanDev) {
+    bool fanOn = currentSpeed > 0;
+    if (!fanPowerReportValid || reportedFanOn != fanOn) {
+      if (fanDev->sendPowerStateEvent(fanOn)) {
+        reportedFanOn = fanOn; fanPowerReportValid = true;
+      }
+    }
+    // Fan hizi 1..3 araliginda; kapaliyken hiz gonderilmez (uygulama son hizi gostermeye devam eder)
+    if (fanOn && (!fanSpeedReportValid || reportedFanSpeed != currentSpeed)) {
+      if (fanDev->sendRangeValueEvent(currentSpeed)) {
+        reportedFanSpeed = currentSpeed; fanSpeedReportValid = true;
+      }
     }
   }
 }
 
-// Uygulama / asistan: Ac-Kapat -> isik
-bool onPowerState(const String&, bool& state) {
+// Uygulama / asistan: Isik cihazi ac-kapat
+bool onLightPower(const String&, bool& state) {
+  Serial.printf("[Sinric] Isik %s\n", state ? "ac" : "kapat");
   lightState = state;
   applyOutputs();
   reportedLight = state; lightReportValid = true;   // cevap zaten bu durumu bildiriyor
   return true;
 }
 
-// Uygulama: hiz ayari (0-3) -> motor
-bool onSetting(const String&, const String& settingId, SettingValue& value) {
-  int v;
-  if      (std::holds_alternative<int>(value))    v = std::get<int>(value);
-  else if (std::holds_alternative<float>(value))  v = (int)lroundf(std::get<float>(value));  // sayilar float gelir
-  else if (std::holds_alternative<String>(value)) v = std::get<String>(value).toInt();
-  else {
-    Serial.printf("[Sinric] Ayar '%s' desteklenmeyen tipte\n", settingId.c_str());
-    return false;
-  }
-  Serial.printf("[Sinric] Ayar geldi: id='%s' deger=%d\n", settingId.c_str(), v);
+// Uygulama / asistan: Fan cihazi ac-kapat. Acilinca en son kullanilan hiz.
+bool onFanPower(const String&, bool& state) {
+  Serial.printf("[Sinric] Fan %s\n", state ? "ac" : "kapat");
+  if (state) { if (currentSpeed == 0) currentSpeed = lastOnSpeed; }
+  else       currentSpeed = 0;
+  applyOutputs();
+  reportedFanOn = state; fanPowerReportValid = true;
+  return true;   // acilista hiz degistiyse syncCloud hiz olayini ayrica gonderir
+}
 
-  if (settingId != SPEED_SETTING_ID) {
-    Serial.printf("[Sinric] Bilinmeyen ayar ID'si. Koddaki SPEED_SETTING_ID'yi \"%s\" yap.\n", settingId.c_str());
-    return false;
-  }
-  if (v < 0 || v > 3) return false;
-
+// Uygulama / asistan: fan hizi 1..3. Fan kapaliyken hiz secilirse fan o hizda acilir.
+bool onFanSpeed(const String&, int& value) {
+  int v = constrain(value, 1, 3);
+  Serial.printf("[Sinric] Fan hizi %d\n", v);
   currentSpeed = v;
   applyOutputs();
-  value = v;                                        // cevapta tam sayi donsun
-  reportedSpeed = v; speedReportValid = true;
+  value = v;
+  reportedFanSpeed = v; fanSpeedReportValid = true;
+  return true;   // fan kapaliyken acildiysa syncCloud "acik" olayini ayrica gonderir
+}
+
+// Alexa "hizi artir/azalt" gibi goreli komutlar: value = degisim miktari, cevapta yeni mutlak hiz
+bool onFanSpeedAdjust(const String&, int& delta) {
+  int base = currentSpeed > 0 ? currentSpeed : lastOnSpeed;
+  int v = constrain(base + delta, 1, 3);
+  Serial.printf("[Sinric] Fan hizi %+d -> %d\n", delta, v);
+  currentSpeed = v;
+  applyOutputs();
+  delta = v;
+  reportedFanSpeed = v; fanSpeedReportValid = true;
   return true;
 }
 
+bool idLooksValid(const String& id) { return id.length() >= 20; }
+
 bool credentialsValid() {
-  return appKey.length() >= 30 && appSecret.length() >= 30 && deviceId.length() >= 20;
+  return appKey.length() >= 30 && appSecret.length() >= 30 && (idLooksValid(lightId) || idLooksValid(fanId));
 }
 
 void startSinric() {
   if (sinricStarted) return;
   if (!credentialsValid()) {
-    Serial.println("[Sinric] Bilgiler eksik, sadece yerel calisma. (Hiz tusuna 5 sn basip portaldan gir)");
+    Serial.println("[Sinric] Bilgiler eksik, sadece yerel calisma. (Hiz 1 tusuna 5 sn basip birak, portaldan gir)");
     return;
   }
   // SinricPro[id] gecici bir Proxy dondurur; referansa baglamak onu gercek cihaza cevirir.
-  SinricProSwitch& dev = SinricPro[deviceId];
-  sinricDev = &dev;
-  dev.onPowerState(onPowerState);
-  dev.onSetSetting(onSetting);
+  if (idLooksValid(lightId)) {
+    SinricProSwitch& l = SinricPro[lightId];
+    lightDev = &l;
+    l.onPowerState(onLightPower);
+  } else {
+    Serial.println("[Sinric] Isik cihazi ID'si yok, isik sadece tustan calisir");
+  }
+  if (idLooksValid(fanId)) {
+    SinricProFanUS& f = SinricPro[fanId];
+    fanDev = &f;
+    f.onPowerState(onFanPower);
+    f.onRangeValue(onFanSpeed);
+    f.onAdjustRangeValue(onFanSpeedAdjust);
+  } else {
+    Serial.println("[Sinric] Fan cihazi ID'si yok, motor sadece tustan calisir");
+  }
 
   SinricPro.onConnected([]() {
     Serial.println("[Sinric] Baglandi");
-    lightReportValid = false; speedReportValid = false;   // yeniden baglaninca durumu esitle
+    // yeniden baglaninca tum durumu esitle
+    lightReportValid = false; fanPowerReportValid = false; fanSpeedReportValid = false;
   });
   SinricPro.onDisconnected([]() { Serial.println("[Sinric] Baglanti koptu"); });
 
@@ -351,11 +478,13 @@ void loadSettings() {
   prefs.begin("aspirator", false);
   appKey    = loadOrSeed("appKey",    SECRET_APP_KEY);
   appSecret = loadOrSeed("appSecret", SECRET_APP_SECRET);
-  deviceId  = loadOrSeed("deviceId",  SECRET_DEVICE_ID);
+  lightId   = loadOrSeed("deviceId",  SECRET_DEVICE_ID);
+  fanId     = loadOrSeed("fanId",     SECRET_FAN_ID);
 
   pAppKey.setValue(appKey.c_str(), 64);
   pAppSecret.setValue("", 128);                 // gizli: formda gosterilmez
-  pDeviceId.setValue(deviceId.c_str(), 40);
+  pLightId.setValue(lightId.c_str(), 40);
+  pFanId.setValue(fanId.c_str(), 40);
 }
 
 String cleanParam(WiFiManagerParameter& p) {
@@ -366,17 +495,20 @@ String cleanParam(WiFiManagerParameter& p) {
 
 // Portalda "Save" basilinca WiFiManager cagirir (WiFi sayfasi veya Setup sayfasi)
 void onParamsSaved() {
-  String k = cleanParam(pAppKey), s = cleanParam(pAppSecret), d = cleanParam(pDeviceId);
+  String k = cleanParam(pAppKey), s = cleanParam(pAppSecret);
+  String l = cleanParam(pLightId), f = cleanParam(pFanId);
   pAppSecret.setValue("", 128);                 // yazilan secret sayfada tekrar gorunmesin
   if (k.isEmpty()) k = appKey;                  // bos birakilan alan eski degeri korur
   if (s.isEmpty()) s = appSecret;
-  if (d.isEmpty()) d = deviceId;
-  if (k == appKey && s == appSecret && d == deviceId) return;
+  if (l.isEmpty()) l = lightId;
+  if (f.isEmpty()) f = fanId;
+  if (k == appKey && s == appSecret && l == lightId && f == fanId) return;
 
-  appKey = k; appSecret = s; deviceId = d;
+  appKey = k; appSecret = s; lightId = l; fanId = f;
   prefs.putString("appKey", appKey);
   prefs.putString("appSecret", appSecret);
-  prefs.putString("deviceId", deviceId);
+  prefs.putString("deviceId", lightId);
+  prefs.putString("fanId", fanId);
   paramsChanged = true;
   paramsChangedAt = millis();
   Serial.println("[Ayar] SinricPro bilgileri kaydedildi");
@@ -395,6 +527,13 @@ void factoryReset() {
 // =====================================================================
 //  AG
 // =====================================================================
+
+void applyTxPower() {
+#if WIFI_LOW_TX_POWER
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
+#endif
+}
+
 void startConnecting() {
   WiFi.mode(WIFI_STA);
   WiFi.begin();                       // WiFiManager'in kaydettigi SSID/sifre
@@ -582,13 +721,12 @@ void setup() {
   initOutput(PIN_LED_LIGHT, LED_OFF);
   for (int i = 0; i < 3; i++) initOutput(PIN_LED_SPEED[i], LED_OFF);
 
-  btnLight.begin();
-  btnSpeed.begin();
-
   Serial.begin(115200);
   delay(200);
   Serial.printf("\n[Aspirator] Surum %s\n", FW_VERSION);
-  ledSelfTest();
+  ledSelfTest();      // ~1.6 sn; bu arada TTP224 de acilis kalibrasyonunu bitirir
+
+  panel.begin();
 
   loadSettings();
   otaBootCheck();
@@ -601,7 +739,8 @@ void setup() {
   wm.setMenu(menu);
   wm.addParameter(&pAppKey);
   wm.addParameter(&pAppSecret);
-  wm.addParameter(&pDeviceId);
+  wm.addParameter(&pLightId);
+  wm.addParameter(&pFanId);
 
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
@@ -614,28 +753,38 @@ void setup() {
 
 void loop() {
   // --- Fiziksel tuslar (internetten bagimsiz, her zaman calisir) ---
-  switch (btnLight.update()) {
-    case TouchButton::SHORT_PRESS:
-      lightState = !lightState;
-      applyOutputs();
-      break;
-    case TouchButton::LONG_PRESS:
-      factoryReset();
-      break;
-    default: break;
+  TouchPanel::Event ev = panel.update();
+
+  // Uzun basma esigi gecildiyse tum LED'ler yanar ("simdi birak"); bitince eski hale doner
+  static bool longFeedback = false;
+  if (panel.longReady() != longFeedback) {
+    longFeedback = panel.longReady();
+    if (longFeedback) {
+      digitalWrite(PIN_LED_LIGHT, LED_ON);
+      for (int i = 0; i < 3; i++) digitalWrite(PIN_LED_SPEED[i], LED_ON);
+    } else {
+      refreshLeds();
+    }
   }
 
-  switch (btnSpeed.update()) {
-    case TouchButton::SHORT_PRESS:
-      currentSpeed = (currentSpeed + 1) % 4;   // 0 > 1 > 2 > 3 > 0
-      applyOutputs();
-      break;
-    case TouchButton::LONG_PRESS:
+  if (ev.type == TouchPanel::SHORT_PRESS) {
+    Serial.printf("[Tus] %s\n", KEY_NAMES[ev.key]);
+    if (ev.key == KEY_LIGHT) {
+      lightState = !lightState;
+    } else {
+      int s = ev.key;                                  // KEY_SPEED1..3 = 1..3
+      currentSpeed = (currentSpeed == s) ? 0 : s;      // ayni hiza tekrar basmak motoru kapatir
+    }
+    applyOutputs();
+  } else if (ev.type == TouchPanel::LONG_PRESS) {
+    Serial.printf("[Tus] %s (uzun)\n", KEY_NAMES[ev.key]);
+    if (ev.key == KEY_LIGHT) {
+      factoryReset();
+    } else if (ev.key == KEY_SPEED1) {
       Serial.println("[Tus] Kurulum portali elle aciliyor");
       blinkAllLeds(2, 150);
       startPortal(PORTAL_TIMEOUT_S);
-      break;
-    default: break;
+    }
   }
 
   // --- Ag / bulut ---
